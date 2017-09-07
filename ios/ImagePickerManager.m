@@ -3,7 +3,6 @@
 #import <AssetsLibrary/AssetsLibrary.h>
 #import <AVFoundation/AVFoundation.h>
 #import <Photos/Photos.h>
-#import <React/RCTUtils.h>
 
 @import MobileCoreServices;
 
@@ -81,7 +80,10 @@ RCT_EXPORT_METHOD(showImagePicker:(NSDictionary *)options callback:(RCTResponseS
     }
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *root = RCTPresentedViewController();
+        UIViewController *root = [[[[UIApplication sharedApplication] delegate] window] rootViewController];
+        while (root.presentedViewController != nil) {
+            root = root.presentedViewController;
+        }
 
         /* On iPad, UIAlertController presents a popover view rather than an action sheet like on iPhone. We must provide the location
         of the location to show the popover in this case. For simplicity, we'll just display it on the bottom center of the screen
@@ -187,7 +189,10 @@ RCT_EXPORT_METHOD(showImagePicker:(NSDictionary *)options callback:(RCTResponseS
     // Check permissions
     void (^showPickerViewController)() = ^void() {
         dispatch_async(dispatch_get_main_queue(), ^{
-            UIViewController *root = RCTPresentedViewController();
+            UIViewController *root = [[[[UIApplication sharedApplication] delegate] window] rootViewController];
+            while (root.presentedViewController != nil) {
+                root = root.presentedViewController;
+            }
             [root presentViewController:self.picker animated:YES completion:nil];
         });
     };
@@ -241,273 +246,45 @@ RCT_EXPORT_METHOD(showImagePicker:(NSDictionary *)options callback:(RCTResponseS
         NSString *fileName;
         if ([mediaType isEqualToString:(NSString *)kUTTypeImage]) {
             NSString *tempFileName = [[NSUUID UUID] UUIDString];
-            if (imageURL && [[imageURL absoluteString] rangeOfString:@"ext=GIF"].location != NSNotFound) {
-                fileName = [tempFileName stringByAppendingString:@".gif"];
-            }
-            else if ([[[self.options objectForKey:@"imageFileType"] stringValue] isEqualToString:@"png"]) {
+            if ([[[self.options objectForKey:@"imageFileType"] stringValue] isEqualToString:@"png"]) {
                 fileName = [tempFileName stringByAppendingString:@".png"];
             }
             else {
                 fileName = [tempFileName stringByAppendingString:@".jpg"];
             }
         }
-        else {
-            NSURL *videoURL = info[UIImagePickerControllerMediaURL];
-            fileName = videoURL.lastPathComponent;
-        }
 
         // We default to path to the temporary directory
         NSString *path = [[NSTemporaryDirectory()stringByStandardizingPath] stringByAppendingPathComponent:fileName];
-
-        // If storage options are provided, we use the documents directory which is persisted
-        if ([self.options objectForKey:@"storageOptions"] && [[self.options objectForKey:@"storageOptions"] isKindOfClass:[NSDictionary class]]) {
-            NSDictionary *storageOptions = [self.options objectForKey:@"storageOptions"];
-
-            NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-            NSString *documentsDirectory = [paths objectAtIndex:0];
-            path = [documentsDirectory stringByAppendingPathComponent:fileName];
-
-            // Creates documents subdirectory, if provided
-            if ([storageOptions objectForKey:@"path"]) {
-                NSString *newPath = [documentsDirectory stringByAppendingPathComponent:[storageOptions objectForKey:@"path"]];
-                NSError *error;
-                [[NSFileManager defaultManager] createDirectoryAtPath:newPath withIntermediateDirectories:YES attributes:nil error:&error];
-                if (error) {
-                    NSLog(@"Error creating documents subdirectory: %@", error);
-                    self.callback(@[@{@"error": error.localizedFailureReason}]);
-                    return;
-                }
-                else {
-                    path = [newPath stringByAppendingPathComponent:fileName];
-                }
-            }
-        }
 
         // Create the response object
         self.response = [[NSMutableDictionary alloc] init];
 
         if ([mediaType isEqualToString:(NSString *)kUTTypeImage]) { // PHOTOS
-            UIImage *image;
-            if ([[self.options objectForKey:@"allowsEditing"] boolValue]) {
-                image = [info objectForKey:UIImagePickerControllerEditedImage];
-            }
-            else {
-                image = [info objectForKey:UIImagePickerControllerOriginalImage];
-            }
+            ALAssetsLibrary *assetLibrary=[[ALAssetsLibrary alloc] init];
+            [assetLibrary assetForURL:imageURL resultBlock:^(ALAsset *asset)
+             {
+                 ALAssetRepresentation *rep = [asset defaultRepresentation];
+                 Byte *buffer = (Byte*)malloc(rep.size);
+                 NSUInteger buffered = [rep getBytes:buffer fromOffset:0 length:rep.size error:nil];
+                 NSData *data = [NSData dataWithBytesNoCopy:buffer length:buffered freeWhenDone:YES];//this is NSData may be what you want
+                 [data writeToFile:path atomically:YES];//you can save image later
+             }
+                         failureBlock:^(NSError *err)
+             {
+                 NSLog(@"Error: %@",[err localizedDescription]);
+                 
+             }
+             ];
 
-            if (imageURL) {
-                PHAsset *pickedAsset = [PHAsset fetchAssetsWithALAssetURLs:@[imageURL] options:nil].lastObject;
-                NSString *originalFilename = [self originalFilenameForAsset:pickedAsset assetType:PHAssetResourceTypePhoto];
-                self.response[@"fileName"] = originalFilename ?: [NSNull null];
-                if (pickedAsset.location) {
-                    self.response[@"latitude"] = @(pickedAsset.location.coordinate.latitude);
-                    self.response[@"longitude"] = @(pickedAsset.location.coordinate.longitude);
-                }
-                if (pickedAsset.creationDate) {
-                    self.response[@"timestamp"] = [[ImagePickerManager ISO8601DateFormatter] stringFromDate:pickedAsset.creationDate];
-                }
-            }
-
-            // GIFs break when resized, so we handle them differently
-            if (imageURL && [[imageURL absoluteString] rangeOfString:@"ext=GIF"].location != NSNotFound) {
-                ALAssetsLibrary* assetsLibrary = [[ALAssetsLibrary alloc] init];
-                [assetsLibrary assetForURL:imageURL resultBlock:^(ALAsset *asset) {
-                    ALAssetRepresentation *rep = [asset defaultRepresentation];
-                    Byte *buffer = (Byte*)malloc(rep.size);
-                    NSUInteger buffered = [rep getBytes:buffer fromOffset:0.0 length:rep.size error:nil];
-                    NSData *data = [NSData dataWithBytesNoCopy:buffer length:buffered freeWhenDone:YES];
-                    [data writeToFile:path atomically:YES];
-
-                    NSMutableDictionary *gifResponse = [[NSMutableDictionary alloc] init];
-                    [gifResponse setObject:@(image.size.width) forKey:@"width"];
-                    [gifResponse setObject:@(image.size.height) forKey:@"height"];
-
-                    BOOL vertical = (image.size.width < image.size.height) ? YES : NO;
-                    [gifResponse setObject:@(vertical) forKey:@"isVertical"];
-
-                    if (![[self.options objectForKey:@"noData"] boolValue]) {
-                        NSString *dataString = [data base64EncodedStringWithOptions:0];
-                        [gifResponse setObject:dataString forKey:@"data"];
-                    }
-
-                    NSURL *fileURL = [NSURL fileURLWithPath:path];
-                    [gifResponse setObject:[fileURL absoluteString] forKey:@"uri"];
-
-                    NSNumber *fileSizeValue = nil;
-                    NSError *fileSizeError = nil;
-                    [fileURL getResourceValue:&fileSizeValue forKey:NSURLFileSizeKey error:&fileSizeError];
-                    if (fileSizeValue){
-                        [gifResponse setObject:fileSizeValue forKey:@"fileSize"];
-                    }
-
-                    self.callback(@[gifResponse]);
-                } failureBlock:^(NSError *error) {
-                    self.callback(@[@{@"error": error.localizedFailureReason}]);
-                }];
-                return;
-            }
-
-            image = [self fixOrientation:image];  // Rotate the image for upload to web
-
-            // If needed, downscale image
-            float maxWidth = image.size.width;
-            float maxHeight = image.size.height;
-            if ([self.options valueForKey:@"maxWidth"]) {
-                maxWidth = [[self.options valueForKey:@"maxWidth"] floatValue];
-            }
-            if ([self.options valueForKey:@"maxHeight"]) {
-                maxHeight = [[self.options valueForKey:@"maxHeight"] floatValue];
-            }
-            image = [self downscaleImageIfNecessary:image maxWidth:maxWidth maxHeight:maxHeight];
-
-            NSData *data;
-            if ([[[self.options objectForKey:@"imageFileType"] stringValue] isEqualToString:@"png"]) {
-                data = UIImagePNGRepresentation(image);
-            }
-            else {
-                data = UIImageJPEGRepresentation(image, [[self.options valueForKey:@"quality"] floatValue]);
-            }
-            [data writeToFile:path atomically:YES];
-
-            if (![[self.options objectForKey:@"noData"] boolValue]) {
-                NSString *dataString = [data base64EncodedStringWithOptions:0]; // base64 encoded image string
-                [self.response setObject:dataString forKey:@"data"];
-            }
-
-            BOOL vertical = (image.size.width < image.size.height) ? YES : NO;
-            [self.response setObject:@(vertical) forKey:@"isVertical"];
             NSURL *fileURL = [NSURL fileURLWithPath:path];
             NSString *filePath = [fileURL absoluteString];
             [self.response setObject:filePath forKey:@"uri"];
-
-            // add ref to the original image
-            NSString *origURL = [imageURL absoluteString];
-            if (origURL) {
-              [self.response setObject:origURL forKey:@"origURL"];
-            }
-
-            NSNumber *fileSizeValue = nil;
-            NSError *fileSizeError = nil;
-            [fileURL getResourceValue:&fileSizeValue forKey:NSURLFileSizeKey error:&fileSizeError];
-            if (fileSizeValue){
-                [self.response setObject:fileSizeValue forKey:@"fileSize"];
-            }
-
-            [self.response setObject:@(image.size.width) forKey:@"width"];
-            [self.response setObject:@(image.size.height) forKey:@"height"];
-
-            NSDictionary *storageOptions = [self.options objectForKey:@"storageOptions"];
-            if (storageOptions && [[storageOptions objectForKey:@"cameraRoll"] boolValue] == YES && self.picker.sourceType == UIImagePickerControllerSourceTypeCamera) {
-                ALAssetsLibrary *library = [[ALAssetsLibrary alloc] init];
-                if ([[storageOptions objectForKey:@"waitUntilSaved"] boolValue]) {
-                    [library writeImageToSavedPhotosAlbum:image.CGImage metadata:[info valueForKey:UIImagePickerControllerMediaMetadata] completionBlock:^(NSURL *assetURL, NSError *error) {
-                        if (error) {
-                            NSLog(@"Error while saving picture into photo album");
-                        } else {
-                            // when the image has been saved in the photo album
-                            if (assetURL) {
-                                PHAsset *capturedAsset = [PHAsset fetchAssetsWithALAssetURLs:@[assetURL] options:nil].lastObject;
-                                NSString *originalFilename = [self originalFilenameForAsset:capturedAsset assetType:PHAssetResourceTypePhoto];
-                                self.response[@"fileName"] = originalFilename ?: [NSNull null];
-                                // This implementation will never have a location for the captured image, it needs to be added manually with CoreLocation code here.
-                                if (capturedAsset.creationDate) {
-                                    self.response[@"timestamp"] = [[ImagePickerManager ISO8601DateFormatter] stringFromDate:capturedAsset.creationDate];
-                                }
-                            }
-                            self.callback(@[self.response]);
-                        }
-                    }];
-                } else {
-                    [library writeImageToSavedPhotosAlbum:image.CGImage metadata:[info valueForKey:UIImagePickerControllerMediaMetadata] completionBlock:nil];
-                }
-            }
         }
-        else { // VIDEO
-            NSURL *videoRefURL = info[UIImagePickerControllerReferenceURL];
-            NSURL *videoURL = info[UIImagePickerControllerMediaURL];
-            NSURL *videoDestinationURL = [NSURL fileURLWithPath:path];
+        
 
-            if (videoRefURL) {
-                PHAsset *pickedAsset = [PHAsset fetchAssetsWithALAssetURLs:@[videoRefURL] options:nil].lastObject;
-                NSString *originalFilename = [self originalFilenameForAsset:pickedAsset assetType:PHAssetResourceTypeVideo];
-                self.response[@"fileName"] = originalFilename ?: [NSNull null];
-                if (pickedAsset.location) {
-                    self.response[@"latitude"] = @(pickedAsset.location.coordinate.latitude);
-                    self.response[@"longitude"] = @(pickedAsset.location.coordinate.longitude);
-                }
-                if (pickedAsset.creationDate) {
-                    self.response[@"timestamp"] = [[ImagePickerManager ISO8601DateFormatter] stringFromDate:pickedAsset.creationDate];
-                }
-            }
-
-            if ([videoURL.URLByResolvingSymlinksInPath.path isEqualToString:videoDestinationURL.URLByResolvingSymlinksInPath.path] == NO) {
-                NSFileManager *fileManager = [NSFileManager defaultManager];
-
-                // Delete file if it already exists
-                if ([fileManager fileExistsAtPath:videoDestinationURL.path]) {
-                    [fileManager removeItemAtURL:videoDestinationURL error:nil];
-                }
-
-                if (videoURL) { // Protect against reported crash
-                  NSError *error = nil;
-                  [fileManager moveItemAtURL:videoURL toURL:videoDestinationURL error:&error];
-                  if (error) {
-                      self.callback(@[@{@"error": error.localizedFailureReason}]);
-                      return;
-                  }
-                }
-            }
-
-            [self.response setObject:videoDestinationURL.absoluteString forKey:@"uri"];
-            if (videoRefURL.absoluteString) {
-                [self.response setObject:videoRefURL.absoluteString forKey:@"origURL"];
-            }
-
-            NSDictionary *storageOptions = [self.options objectForKey:@"storageOptions"];
-            if (storageOptions && [[storageOptions objectForKey:@"cameraRoll"] boolValue] == YES && self.picker.sourceType == UIImagePickerControllerSourceTypeCamera) {
-                ALAssetsLibrary *library = [[ALAssetsLibrary alloc] init];
-                [library writeVideoAtPathToSavedPhotosAlbum:videoDestinationURL completionBlock:^(NSURL *assetURL, NSError *error) {
-                    if (error) {
-                        self.callback(@[@{@"error": error.localizedFailureReason}]);
-                        return;
-                    } else {
-                        NSLog(@"Save video succeed.");
-                        if ([[storageOptions objectForKey:@"waitUntilSaved"] boolValue]) {
-                            if (assetURL) {
-                                PHAsset *capturedAsset = [PHAsset fetchAssetsWithALAssetURLs:@[assetURL] options:nil].lastObject;
-                                NSString *originalFilename = [self originalFilenameForAsset:capturedAsset assetType:PHAssetResourceTypeVideo];
-                                self.response[@"fileName"] = originalFilename ?: [NSNull null];
-                                // This implementation will never have a location for the captured image, it needs to be added manually with CoreLocation code here.
-                                if (capturedAsset.creationDate) {
-                                    self.response[@"timestamp"] = [[ImagePickerManager ISO8601DateFormatter] stringFromDate:capturedAsset.creationDate];
-                                }
-                            }
-
-                            self.callback(@[self.response]);
-                        }
-                    }
-                }];
-            }
-        }
-
-        // If storage options are provided, check the skipBackup flag
-        if ([self.options objectForKey:@"storageOptions"] && [[self.options objectForKey:@"storageOptions"] isKindOfClass:[NSDictionary class]]) {
-            NSDictionary *storageOptions = [self.options objectForKey:@"storageOptions"];
-
-            if ([[storageOptions objectForKey:@"skipBackup"] boolValue]) {
-                [self addSkipBackupAttributeToItemAtPath:path]; // Don't back up the file to iCloud
-            }
-
-            if ([[storageOptions objectForKey:@"waitUntilSaved"] boolValue] == NO ||
-                [[storageOptions objectForKey:@"cameraRoll"] boolValue] == NO ||
-                self.picker.sourceType != UIImagePickerControllerSourceTypeCamera)
-            {
-                self.callback(@[self.response]);
-            }
-        }
-        else {
-            self.callback(@[self.response]);
-        }
+        
+        self.callback(@[self.response]);
     };
 
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -565,107 +342,6 @@ RCT_EXPORT_METHOD(showImagePicker:(NSDictionary *)options callback:(RCTResponseS
     }
 }
 
-- (UIImage*)downscaleImageIfNecessary:(UIImage*)image maxWidth:(float)maxWidth maxHeight:(float)maxHeight
-{
-    UIImage* newImage = image;
-
-    // Nothing to do here
-    if (image.size.width <= maxWidth && image.size.height <= maxHeight) {
-        return newImage;
-    }
-
-    CGSize scaledSize = CGSizeMake(image.size.width, image.size.height);
-    if (maxWidth < scaledSize.width) {
-        scaledSize = CGSizeMake(maxWidth, (maxWidth / scaledSize.width) * scaledSize.height);
-    }
-    if (maxHeight < scaledSize.height) {
-        scaledSize = CGSizeMake((maxHeight / scaledSize.height) * scaledSize.width, maxHeight);
-    }
-
-    // If the pixels are floats, it causes a white line in iOS8 and probably other versions too
-    scaledSize.width = (int)scaledSize.width;
-    scaledSize.height = (int)scaledSize.height;
-
-    UIGraphicsBeginImageContext(scaledSize); // this will resize
-    [image drawInRect:CGRectMake(0, 0, scaledSize.width, scaledSize.height)];
-    newImage = UIGraphicsGetImageFromCurrentImageContext();
-    if (newImage == nil) {
-        NSLog(@"could not scale image");
-    }
-    UIGraphicsEndImageContext();
-
-    return newImage;
-}
-
-- (UIImage *)fixOrientation:(UIImage *)srcImg {
-    if (srcImg.imageOrientation == UIImageOrientationUp) {
-        return srcImg;
-    }
-
-    CGAffineTransform transform = CGAffineTransformIdentity;
-    switch (srcImg.imageOrientation) {
-        case UIImageOrientationDown:
-        case UIImageOrientationDownMirrored:
-            transform = CGAffineTransformTranslate(transform, srcImg.size.width, srcImg.size.height);
-            transform = CGAffineTransformRotate(transform, M_PI);
-            break;
-
-        case UIImageOrientationLeft:
-        case UIImageOrientationLeftMirrored:
-            transform = CGAffineTransformTranslate(transform, srcImg.size.width, 0);
-            transform = CGAffineTransformRotate(transform, M_PI_2);
-            break;
-
-        case UIImageOrientationRight:
-        case UIImageOrientationRightMirrored:
-            transform = CGAffineTransformTranslate(transform, 0, srcImg.size.height);
-            transform = CGAffineTransformRotate(transform, -M_PI_2);
-            break;
-        case UIImageOrientationUp:
-        case UIImageOrientationUpMirrored:
-            break;
-    }
-
-    switch (srcImg.imageOrientation) {
-        case UIImageOrientationUpMirrored:
-        case UIImageOrientationDownMirrored:
-            transform = CGAffineTransformTranslate(transform, srcImg.size.width, 0);
-            transform = CGAffineTransformScale(transform, -1, 1);
-            break;
-
-        case UIImageOrientationLeftMirrored:
-        case UIImageOrientationRightMirrored:
-            transform = CGAffineTransformTranslate(transform, srcImg.size.height, 0);
-            transform = CGAffineTransformScale(transform, -1, 1);
-            break;
-        case UIImageOrientationUp:
-        case UIImageOrientationDown:
-        case UIImageOrientationLeft:
-        case UIImageOrientationRight:
-            break;
-    }
-
-    CGContextRef ctx = CGBitmapContextCreate(NULL, srcImg.size.width, srcImg.size.height, CGImageGetBitsPerComponent(srcImg.CGImage), 0, CGImageGetColorSpace(srcImg.CGImage), CGImageGetBitmapInfo(srcImg.CGImage));
-    CGContextConcatCTM(ctx, transform);
-    switch (srcImg.imageOrientation) {
-        case UIImageOrientationLeft:
-        case UIImageOrientationLeftMirrored:
-        case UIImageOrientationRight:
-        case UIImageOrientationRightMirrored:
-            CGContextDrawImage(ctx, CGRectMake(0,0,srcImg.size.height,srcImg.size.width), srcImg.CGImage);
-            break;
-
-        default:
-            CGContextDrawImage(ctx, CGRectMake(0,0,srcImg.size.width,srcImg.size.height), srcImg.CGImage);
-            break;
-    }
-
-    CGImageRef cgimg = CGBitmapContextCreateImage(ctx);
-    UIImage *img = [UIImage imageWithCGImage:cgimg];
-    CGContextRelease(ctx);
-    CGImageRelease(cgimg);
-    return img;
-}
 
 - (BOOL)addSkipBackupAttributeToItemAtPath:(NSString *) filePathString
 {
